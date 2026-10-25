@@ -7,20 +7,22 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <iomanip>
 
 // Parthenon headers
 #include <parthenon/package.hpp>
 
 // AthenaPK headers
 #include "../eos/adiabatic_hydro.hpp"
+#include "../eos/adiabatic_mhd.hpp"
 #include "../main.hpp"
 #include "../pgen/pgen.hpp"
-#include "../recon/plm_simple.hpp"
 #include "../refinement/refinement.hpp"
 #include "defs.hpp"
 #include "hydro.hpp"
 #include "outputs/outputs.hpp"
-#include "rsolvers/hydro_hlle.hpp"
+#include "recon/recon.hpp"
 #include "utils/error_checking.hpp"
 
 using namespace parthenon::package::prelude;
@@ -42,7 +44,7 @@ parthenon::Packages_t ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   return packages;
 }
 
-template <Hst hst, int idx = -1>
+template <Hst hst, int idx = -1, Reconstruction recon = Reconstruction::weno5>
 Real HydroHst(MeshData<Real> *md) {
   const auto &cellbounds = md->GetBlockData(0)->GetBlockPointer()->cellbounds;
   IndexRange ib = cellbounds.GetBoundsI(IndexDomain::interior);
@@ -50,6 +52,7 @@ Real HydroHst(MeshData<Real> *md) {
   IndexRange kb = cellbounds.GetBoundsK(IndexDomain::interior);
 
   const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
+  const bool three_d = cons_pack.GetNdim() == 3;
   Real sum = 0.0;
 
   // Sanity checks
@@ -73,7 +76,138 @@ Real HydroHst(MeshData<Real> *md) {
                   (SQR(cons(IM1, k, j, i)) + SQR(cons(IM2, k, j, i)) +
                    SQR(cons(IM3, k, j, i))) *
                   coords.CellVolume(k, j, i);
-        }
+        } else if (hst == Hst::emag) {
+          lsum += 0.5 *
+                  (SQR(cons(IB1, k, j, i)) + SQR(cons(IB2, k, j, i)) +
+                   SQR(cons(IB3, k, j, i))) *
+                  coords.CellVolume(k, j, i);
+        
+        ///////////////////////////////////////////////////////////////////////////////////////          
+        // original
+        ///////////////////////////////////////////////////////////////////////////////////////          
+
+        // relative divergence of B error, i.e., L * |div(B)| / |B|
+        // } else if (hst == Hst::divb) {
+        //   Real divb =
+        //       (cons(IB1, k, j, i + 1) - cons(IB1, k, j, i - 1)) / coords.Dxc<1>(k, j, i) +
+        //       (cons(IB2, k, j + 1, i) - cons(IB2, k, j - 1, i)) / coords.Dxc<2>(k, j, i);
+        //   if (three_d) {
+        //     divb += (cons(IB3, k + 1, j, i) - cons(IB3, k - 1, j, i)) /
+        //             coords.Dxc<3>(k, j, i);
+        //   }
+
+        //   Real abs_b = std::sqrt(SQR(cons(IB1, k, j, i)) + SQR(cons(IB2, k, j, i)) +
+        //                          SQR(cons(IB3, k, j, i)));
+
+        //   lsum += (abs_b != 0) ? 0.5 *
+        //                              (std::sqrt(SQR(coords.Dxc<1>(k, j, i)) +
+        //                                         SQR(coords.Dxc<2>(k, j, i)) +
+        //                                         SQR(coords.Dxc<3>(k, j, i)))) *
+        //                              std::abs(divb) / abs_b * coords.CellVolume(k, j, i)
+        //                        : 0; // Add zero when abs_b ==0
+        // }
+
+        ///////////////////////////////////////////////////////////////////////////////////////          
+
+        } else if (hst == Hst::divb) {
+
+          Real divb = 0.0;
+
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // 2nd-order central difference for divergence of B
+          ///////////////////////////////////////////////////////////////////////////////////////
+          
+          if constexpr (recon == Reconstruction::weno3) {
+            divb =
+                      (cons(IB1, k, j, i + 1) - cons(IB1, k, j, i - 1)) / (2 * coords.Dxc<1>(k, j, i)) +
+                      (cons(IB2, k, j + 1, i) - cons(IB2, k, j - 1, i)) / (2 * coords.Dxc<2>(k, j, i));
+            
+            if (three_d) {
+              divb += (cons(IB3, k + 1, j, i) - cons(IB3, k - 1, j, i)) / (2 * coords.Dxc<3>(k, j, i));
+            }
+          }
+          
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // 4th-order central difference for divergence of B
+          ///////////////////////////////////////////////////////////////////////////////////////
+          
+          if constexpr (recon == Reconstruction::weno5) {
+            divb =
+              (cons(IB1, k, j, i - 2) - 8.0 * cons(IB1, k, j, i - 1) - 
+              cons(IB1, k, j, i + 2) + 8.0 * cons(IB1, k, j, i + 1)) /
+              (12.0 * coords.Dxc<1>(k, j, i)) +
+              
+              (cons(IB2, k, j - 2, i) - 8.0 * cons(IB2, k, j - 1, i) -
+              cons(IB2, k, j + 2, i) + 8.0 * cons(IB2, k, j + 1, i)) /
+              (12.0 * coords.Dxc<2>(k, j, i));
+
+            if (three_d) {
+              divb += (cons(IB3, k - 2, j, i) - 8.0 * cons(IB3, k - 1, j, i) - 
+                      cons(IB3, k + 2, j, i) + 8.0 * cons(IB3, k + 1, j, i)) /
+                      (12.0 * coords.Dxc<3>(k, j, i));
+            }
+          }
+
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // 6th-order central difference for divergence of B
+          ///////////////////////////////////////////////////////////////////////////////////////
+          
+          if constexpr (recon == Reconstruction::weno7) {
+            divb =
+              (cons(IB1, k, j, i + 3) - 9.0 * cons(IB1, k, j, i + 2) + 45.0 * cons(IB1, k, j, i + 1) - 
+              cons(IB1, k, j, i - 3) + 9.0 * cons(IB1, k, j, i - 2) - 45.0 * cons(IB1, k, j, i - 1)) /
+              (60.0 * coords.Dxc<1>(k, j, i)) +
+
+              (cons(IB2, k, j + 3, i) - 9.0 * cons(IB2, k, j + 2, i) + 45.0 * cons(IB2, k, j + 1, i) - 
+              cons(IB2, k, j - 3, i) + 9.0 * cons(IB2, k, j - 2, i) - 45.0 * cons(IB2, k, j - 1, i)) /
+              (60.0 * coords.Dxc<2>(k, j, i));
+
+            if (three_d) {
+              divb += (cons(IB3, k + 3, j, i) - 9.0 * cons(IB3, k + 2, j, i) + 45.0 * cons(IB3, k + 1, j, i) - 
+                      cons(IB3, k - 3, j, i) + 9.0 * cons(IB3, k - 2, j, i) - 45.0 * cons(IB3, k - 1, j, i)) /
+                      (60.0 * coords.Dxc<3>(k, j, i));
+            }
+          }
+
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // 8th-order central difference for divergence of B
+          ///////////////////////////////////////////////////////////////////////////////////////
+          
+          if constexpr (recon == Reconstruction::weno9) {
+            divb =
+              (3.0 * cons(IB1,k,j,i-4) - 32.0 * cons(IB1,k,j,i-3) + 168.0 * cons(IB1,k,j,i-2) - 672.0 * cons(IB1,k,j,i-1) -
+              3.0 * cons(IB1,k,j,i+4) + 32.0 * cons(IB1,k,j,i+3) - 168.0 * cons(IB1,k,j,i+2) + 672.0 * cons(IB1,k,j,i+1)) / 
+              (840.0 * coords.Dxc<1>(k, j, i)) +
+
+              (3.0 * cons(IB2,k,j-4,i) - 32.0 * cons(IB2,k,j-3,i) + 168.0 * cons(IB2,k,j-2,i) - 672.0 * cons(IB2,k,j-1,i) -
+              3.0 * cons(IB2,k,j+4,i) + 32.0 * cons(IB2,k,j+3,i) - 168.0 * cons(IB2,k,j+2,i) + 672.0 * cons(IB2,k,j+1,i)) / 
+              (840.0 * coords.Dxc<2>(k, j, i));
+
+            if (three_d) {
+              divb += (3.0 * cons(IB3,k-4,j,i) - 32.0 * cons(IB3,k-3,j,i) + 168.0 * cons(IB3,k-2,j,i) - 672.0 * cons(IB3,k-1,j,i) -
+                      3.0 * cons(IB3,k+4,j,i) + 32.0 * cons(IB3,k+3,j,i) - 168.0 * cons(IB3,k+2,j,i) + 672.0 * cons(IB3,k+1,j,i)) / 
+                      (840.0 * coords.Dxc<3>(k, j, i));
+            }
+          }
+
+          ///////////////////////////////////////////////////////////////////////////////////////          
+
+          Real abs_b = std::sqrt(SQR(cons(IB1, k, j, i)) +
+                                 SQR(cons(IB2, k, j, i)) +
+                                 SQR(cons(IB3, k, j, i)));
+
+          lsum += (abs_b != 0)
+                    ?  (std::sqrt(SQR(coords.Dxc<1>(k, j, i)) +
+                                  SQR(coords.Dxc<2>(k, j, i)) +
+                                  SQR(coords.Dxc<3>(k, j, i)))) *
+                                  std::abs(divb) / abs_b * coords.CellVolume(k, j, i)
+                    : 0;  // Add zero when abs_b == 0
+        }        
+
+        ///////////////////////////////////////////////////////////////////////////////////////          
+        // end
+        ///////////////////////////////////////////////////////////////////////////////////////          
+
       },
       sum);
 
@@ -90,17 +224,153 @@ void ConsToPrim(MeshData<Real> *md) {
   eos.ConservedToPrimitive(md);
 }
 
+TaskStatus AddSplitSourcesFirstOrder(MeshData<Real> *md, const SimTime &tm) {
+
+  auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
+
+  if (ProblemSourceFirstOrder != nullptr) {
+    ProblemSourceFirstOrder(md, tm, tm.dt);
+  }
+  return TaskStatus::complete;
+}
+
 std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   auto pkg = std::make_shared<StateDescriptor>("Hydro");
 
   Real cfl = pin->GetOrAddReal("parthenon/time", "cfl", 0.3);
   pkg->AddParam<>("cfl", cfl);
 
-  const int nhydro = 5;
+  const auto fluid_str = pin->GetOrAddString("hydro", "fluid", "euler");
+  auto fluid = Fluid::undefined;
+  int nhydro = -1;
 
+  if (fluid_str == "euler") {
+    fluid = Fluid::euler;
+    nhydro = GetNVars<Fluid::euler>();
+  } else if (fluid_str == "mhd") {
+    fluid = Fluid::mhd;
+    nhydro = GetNVars<Fluid::mhd>();
+  }
+   
+  pkg->AddParam<>("fluid", fluid);
   pkg->AddParam<>("nhydro", nhydro);
 
+  // hyperbolic timestep constraint
+  pkg->AddParam<Real>("dt_hyp", std::numeric_limits<Real>::max(),
+                      Params::Mutability::Mutable);
+
+  // Use hyperbolic timestep constraint by default
+  bool calc_dt_hyp = true;
+  pkg->AddParam<>("calc_dt_hyp", calc_dt_hyp);
+
+  const auto max_dt = pin->GetOrAddReal("hydro", "max_dt", -1.0);
+  pkg->AddParam<>("max_dt", max_dt);
+
+  const auto recon_str = pin->GetOrAddString("hydro", "reconstruction", "weno3");
+  auto recon = Reconstruction::undefined;
+
+  int recon_need_nghost = 5; // largest number for the choices below
+
+  if (recon_str == "weno3") {
+    recon = Reconstruction::weno3;
+    recon_need_nghost = 2;
+  } else if (recon_str == "weno5") {
+    recon = Reconstruction::weno5;
+    recon_need_nghost = 3;
+  } else if (recon_str == "weno7") {
+    recon = Reconstruction::weno7;
+    recon_need_nghost = 4;
+  } else if (recon_str == "weno9") {
+    recon = Reconstruction::weno9;
+    recon_need_nghost = 5;
+  } else if (recon_str == "none") {
+    recon = Reconstruction::none;
+  } else {
+    PARTHENON_FAIL("Spartha: Unknown Reconstruction Method.");
+  }
+
+  pkg->AddParam<>("recon", recon);
+
+  HJFlux2DFunc hj_flux_2d = nullptr;
+  HJFlux3DFunc hj_flux_3d = nullptr;
+  HJAfterstep2DFunc hj_afterstep_2d = nullptr;
+  HJAfterstep3DFunc hj_afterstep_3d = nullptr;
+
+  if (fluid == Fluid::mhd) {
+    switch (recon) {
+
+      case Reconstruction::weno3:
+        hj_flux_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno3>::CalculateHJFluxes2D;
+        hj_flux_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno3>::CalculateHJFluxes3D;
+        hj_afterstep_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno3>::HJAfterstep2D;
+        hj_afterstep_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno3>::HJAfterstep3D;
+        break;
+
+      case Reconstruction::weno5:
+        hj_flux_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno5>::CalculateHJFluxes2D;
+        hj_flux_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno5>::CalculateHJFluxes3D;
+        hj_afterstep_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno5>::HJAfterstep2D;
+        hj_afterstep_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno5>::HJAfterstep3D;
+        break;
+
+      case Reconstruction::weno7:
+        hj_flux_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno7>::CalculateHJFluxes2D;
+        hj_flux_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno7>::CalculateHJFluxes3D;
+        hj_afterstep_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno7>::HJAfterstep2D;
+        hj_afterstep_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno7>::HJAfterstep3D;
+        break;
+
+      case Reconstruction::weno9:
+        hj_flux_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno9>::CalculateHJFluxes2D;
+        hj_flux_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno9>::CalculateHJFluxes3D;
+        hj_afterstep_2d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno9>::HJAfterstep2D;
+        hj_afterstep_3d =
+            &MPReconstruct<Fluid::mhd, Reconstruction::weno9>::HJAfterstep3D;
+        break;
+
+      case Reconstruction::none:
+        break;
+
+      default:
+        PARTHENON_FAIL("Unsupported reconstruction for HJ fluxes.");
+    }
+  }
+
+  // Map contaning all compiled in flux functions
+  std::map<FluxFunKey_t, FluxFun_t *> flux_functions{};
+  // TODO(?) The following line could potentially be set by configure-time options
+  // so that the resulting binary can only contain a subset of included flux functions
+  // to reduce size.
+  add_flux_fun<Fluid::euler, Reconstruction::weno3>(flux_functions);
+  add_flux_fun<Fluid::euler, Reconstruction::weno5>(flux_functions);
+  add_flux_fun<Fluid::euler, Reconstruction::weno7>(flux_functions);
+  add_flux_fun<Fluid::euler, Reconstruction::weno9>(flux_functions);
+  add_flux_fun<Fluid::mhd, Reconstruction::weno3>(flux_functions);
+  add_flux_fun<Fluid::mhd, Reconstruction::weno5>(flux_functions);
+  add_flux_fun<Fluid::mhd, Reconstruction::weno7>(flux_functions);
+  add_flux_fun<Fluid::mhd, Reconstruction::weno9>(flux_functions);
+
+  // flux used in all stages expect the first. First stage is set below based on integr.
+  FluxFun_t *flux_other_stage = nullptr;
+  flux_other_stage = flux_functions.at(std::make_tuple(fluid, recon));
+  
   parthenon::HstVar_list hst_vars = {};
+  
   hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
                                          HydroHst<Hst::idx, IDN>, "mass"));
   hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
@@ -113,33 +383,144 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       HistoryOutputVar(parthenon::UserHistoryOperation::sum, HydroHst<Hst::ekin>, "KE"));
   hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
                                          HydroHst<Hst::idx, IEN>, "tot-E"));
-  pkg->AddParam<>(parthenon::hist_param_key, hst_vars);
+  // if (fluid == Fluid::mhd) {
+  //   hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+  //                                          HydroHst<Hst::emag>, "ME"));
+  //   hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+  //                                          HydroHst<Hst::divb>, "relDivB"));
+  // }
+
+  if (fluid == Fluid::mhd) {
+
+    hst_vars.emplace_back(
+        HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+                        HydroHst<Hst::emag>,
+                        "ME"));
+
+    switch (recon) {
+
+      case Reconstruction::weno3:
+        hst_vars.emplace_back(
+            HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+                            HydroHst<Hst::divb, -1, Reconstruction::weno3>,
+                            "relDivB"));
+        break;
+
+      case Reconstruction::weno5:
+        hst_vars.emplace_back(
+            HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+                            HydroHst<Hst::divb, -1, Reconstruction::weno5>,
+                            "relDivB"));
+        break;
+
+      case Reconstruction::weno7:
+        hst_vars.emplace_back(
+            HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+                            HydroHst<Hst::divb, -1, Reconstruction::weno7>,
+                            "relDivB"));
+        break;
+
+      case Reconstruction::weno9:
+        hst_vars.emplace_back(
+            HistoryOutputVar(parthenon::UserHistoryOperation::sum,
+                            HydroHst<Hst::divb, -1, Reconstruction::weno9>,
+                            "relDivB"));
+        break;
+
+      default:
+        PARTHENON_FAIL("Unsupported reconstruction for divB history output.");
+    }
+  }
+
+
+  pkg->AddParam<>(parthenon::hist_param_key, hst_vars, true);
 
   // not using GetOrAdd here until there's a reasonable default
   const auto nghost = pin->GetInteger("parthenon/mesh", "nghost");
-  if (nghost < 2) {
+  if (nghost < recon_need_nghost) {
     PARTHENON_FAIL("AthenaPK hydro: Need more ghost zones for chosen reconstruction.");
   }
 
-  Real dfloor = pin->GetOrAddReal("hydro", "dfloor", std::sqrt(1024 * float_min));
-  Real pfloor = pin->GetOrAddReal("hydro", "pfloor", std::sqrt(1024 * float_min));
+  const auto integrator_str = pin->GetString("parthenon/time", "integrator");
+  auto integrator = Integrator::undefined;
+  FluxFun_t *flux_first_stage = flux_other_stage;
+
+  if (integrator_str == "rk1") {
+    integrator = Integrator::rk1;
+  } else if (integrator_str == "rk2") {
+    integrator = Integrator::rk2;
+  } else if (integrator_str == "rk3") {
+    integrator = Integrator::rk3;
+  } else if (integrator_str == "vl2") {
+    integrator = Integrator::vl2; 
+  }
+
+  pkg->AddParam<>("integrator", integrator);
+  pkg->AddParam<FluxFun_t *>("flux_first_stage", flux_first_stage);
+  pkg->AddParam<FluxFun_t *>("flux_other_stage", flux_other_stage);
+
+  pkg->AddParam<HJFlux2DFunc>("hj_flux_2d", hj_flux_2d);
+  pkg->AddParam<HJFlux3DFunc>("hj_flux_3d", hj_flux_3d);
+  pkg->AddParam<HJAfterstep2DFunc>("hj_afterstep_2d", hj_afterstep_2d);
+  pkg->AddParam<HJAfterstep3DFunc>("hj_afterstep_3d", hj_afterstep_3d);
+
+  auto first_order_flux_correct =
+      pin->GetOrAddBoolean("hydro", "first_order_flux_correct", false);
+  pkg->AddParam<>("first_order_flux_correct", first_order_flux_correct);
+  if (first_order_flux_correct) {
+    if (fluid == Fluid::euler) {
+      pkg->AddParam<FirstOrderFluxCorrectFun_t *>("first_order_flux_correct_fun",
+                                                  FirstOrderFluxCorrect<Fluid::euler>);
+      // std::cout << "CA OUTPUT: Works in hydro/Initialize" << std::endl;
+    } else if (fluid == Fluid::mhd) {
+      pkg->AddParam<FirstOrderFluxCorrectFun_t *>("first_order_flux_correct_fun",
+                                                  FirstOrderFluxCorrect<Fluid::mhd>);
+    }
+  }
+
+  Real dfloor = pin->GetOrAddReal("hydro", "dfloor", -1.0);
+  Real pfloor = pin->GetOrAddReal("hydro", "pfloor", -1.0);
+  Real efloor = pin->GetOrAddReal("hydro", "efloor", -1.0);
+
+  Real vceil =
+        pin->GetOrAddReal("hydro", "vceil", std::numeric_limits<Real>::infinity());
+  Real eceil =
+        pin->GetOrAddReal("hydro", "eceil", std::numeric_limits<Real>::infinity());
 
   Real gamma = pin->GetReal("hydro", "gamma");
-  AdiabaticHydroEOS eos(pfloor, dfloor, gamma);
-  pkg->AddParam<>("eos", eos);
-  pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
-  pkg->EstimateTimestepMesh = EstimateTimestep;
+  pkg->AddParam<>("AdiabaticIndex", gamma);
+
+  
+  if (fluid == Fluid::euler) {
+    AdiabaticHydroEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
+    pkg->AddParam<>("eos", eos);
+    pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
+    pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::euler>;
+  } else if (fluid == Fluid::mhd) {
+    AdiabaticMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
+    pkg->AddParam<>("eos", eos);
+    pkg->FillDerivedMesh = ConsToPrim<AdiabaticMHDEOS>;
+    pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::mhd>;
+  } 
 
   auto scratch_level = pin->GetOrAddInteger("hydro", "scratch_level", 0);
   pkg->AddParam("scratch_level", scratch_level);
 
   std::string field_name = "cons";
   std::vector<std::string> cons_labels(nhydro);
-  cons_labels[IDN] = "Density";
-  cons_labels[IM1] = "MomentumDensity1";
-  cons_labels[IM2] = "MomentumDensity2";
-  cons_labels[IM3] = "MomentumDensity3";
-  cons_labels[IEN] = "TotalEnergyDensity";
+  cons_labels[IDN] = "density";
+  cons_labels[IM1] = "momentum_density_1";
+  cons_labels[IM2] = "momentum_density_2";
+  cons_labels[IM3] = "momentum_density_3";
+  cons_labels[IEN] = "total_energy_density";
+  if (fluid == Fluid::mhd) {
+    cons_labels[IB1] = "magnetic_field_1";
+    cons_labels[IB2] = "magnetic_field_2";
+    cons_labels[IB3] = "magnetic_field_3";
+    cons_labels[IA1] = "magnetic_potential_1";
+    cons_labels[IA2] = "magnetic_potential_2";
+    cons_labels[IA3] = "magnetic_potential_3";
+  }
   Metadata m(
       {Metadata::Cell, Metadata::Independent, Metadata::FillGhost, Metadata::WithFluxes},
       std::vector<int>({nhydro}), cons_labels);
@@ -148,11 +529,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // TODO(pgrete) check if this could be "one-copy" for two stage SSP integrators
   field_name = "prim";
   std::vector<std::string> prim_labels(nhydro);
-  prim_labels[IDN] = "Density";
-  prim_labels[IV1] = "Velocity1";
-  prim_labels[IV2] = "Velocity2";
-  prim_labels[IV3] = "Velocity3";
-  prim_labels[IPR] = "Pressure";
+  prim_labels[IDN] = "density";
+  prim_labels[IV1] = "velocity_1";
+  prim_labels[IV2] = "velocity_2";
+  prim_labels[IV3] = "velocity_3";
+  prim_labels[IPR] = "pressure";
+  if (fluid == Fluid::mhd) {
+    prim_labels[IB1] = "magnetic_field_1";
+    prim_labels[IB2] = "magnetic_field_2";
+    prim_labels[IB3] = "magnetic_field_3";
+    prim_labels[IA1] = "magnetic_potential_1";
+    prim_labels[IA2] = "magnetic_potential_2";
+    prim_labels[IA3] = "magnetic_potential_3";
+  }
   m = Metadata({Metadata::Cell, Metadata::Derived}, std::vector<int>({nhydro}),
                prim_labels);
   pkg->AddField(field_name, m);
@@ -188,27 +577,32 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     pkg->AddParam<Real>("refinement/maxdensity_refine_above", refine_above);
   }
 
+  if (ProblemInitPackageData != nullptr) {
+    ProblemInitPackageData(pin, pkg.get());
+  }
+
   return pkg;
 }
 
-Real EstimateTimestep(MeshData<Real> *md) {
+template <Fluid fluid>
+Real EstimateHyperbolicTimestep(MeshData<Real> *md) {
   // get to package via first block in Meshdata (which exists by construction)
-  auto pmb = md->GetBlockData(0)->GetBlockPointer();
-  auto hydro_pkg = pmb->packages.Get("Hydro");
+  auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
   const auto &cfl_hyp = hydro_pkg->Param<Real>("cfl");
   const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
-  const auto &eos = hydro_pkg->Param<AdiabaticHydroEOS>("eos");
+  const auto &eos_ =
+      hydro_pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
+                                                 AdiabaticMHDEOS>::type>("eos");
 
-  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
+  IndexRange ib = md->GetBlockData(0)->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBlockData(0)->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBlockData(0)->GetBoundsK(IndexDomain::interior);
 
   Real min_dt_hyperbolic = std::numeric_limits<Real>::max();
 
-  bool nx2 = prim_pack.GetDim(2) > 1;
-  bool nx3 = prim_pack.GetDim(3) > 1;
+  const auto ndim_ = prim_pack.GetNdim();
   Kokkos::parallel_reduce(
-      "EstimateTimestep",
+      "EstimateHyperbolicTimestep",
       Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
           DevExecSpace(), {0, kb.s, jb.s, ib.s},
           {prim_pack.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1},
@@ -216,6 +610,11 @@ Real EstimateTimestep(MeshData<Real> *md) {
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &min_dt) {
         const auto &prim = prim_pack(b);
         const auto &coords = prim_pack.GetCoords(b);
+        // Need to reference variables here so that they are properly caught by
+        // nvcc, which cannot determine captured variables only used within constexpr if.
+        const auto &ndim = ndim_;
+        const auto &eos = eos_;
+
         Real w[(NHYDRO)];
         w[IDN] = prim(IDN, k, j, i);
         w[IV1] = prim(IV1, k, j, i);
@@ -223,36 +622,95 @@ Real EstimateTimestep(MeshData<Real> *md) {
         w[IV3] = prim(IV3, k, j, i);
         w[IPR] = prim(IPR, k, j, i);
         Real lambda_max_x, lambda_max_y, lambda_max_z;
-        lambda_max_x = eos.SoundSpeed(w);
-        lambda_max_y = lambda_max_x;
-        lambda_max_z = lambda_max_x;
+        if constexpr (fluid == Fluid::euler) {
+          lambda_max_x = eos.SoundSpeed(w);
+          lambda_max_y = lambda_max_x;
+          lambda_max_z = lambda_max_x;
 
+        } else if constexpr (fluid == Fluid::mhd) {
+          lambda_max_x = eos.FastMagnetosonicSpeed(
+              w[IDN], w[IPR], prim(IB1, k, j, i), prim(IB2, k, j, i), prim(IB3, k, j, i));
+          if (ndim > 1) {
+            lambda_max_y =
+                eos.FastMagnetosonicSpeed(w[IDN], w[IPR], prim(IB2, k, j, i),
+                                          prim(IB3, k, j, i), prim(IB1, k, j, i));
+          }
+          if (ndim > 2) {
+            lambda_max_z =
+                eos.FastMagnetosonicSpeed(w[IDN], w[IPR], prim(IB3, k, j, i),
+                                          prim(IB1, k, j, i), prim(IB2, k, j, i));
+          }
+        } else {
+          PARTHENON_FAIL("Unknown fluid in EstimateTimestep");
+        }
         min_dt = fmin(min_dt, coords.Dxc<1>(k, j, i) / (fabs(w[IV1]) + lambda_max_x));
-        if (nx2) {
+        if (ndim > 1) {
           min_dt = fmin(min_dt, coords.Dxc<2>(k, j, i) / (fabs(w[IV2]) + lambda_max_y));
         }
-        if (nx3) {
+        if (ndim > 2) {
           min_dt = fmin(min_dt, coords.Dxc<3>(k, j, i) / (fabs(w[IV3]) + lambda_max_z));
         }
       },
       Kokkos::Min<Real>(min_dt_hyperbolic));
 
+  // TODO(pgrete) THIS WORKAROUND IS NOT THREAD SAFE (though this will only become
+  // relevant once parthenon uses host-multithreading in the driver).
+  // We need to save the the hyperbolic part to recover it later as
+  // the divergence cleaning speed is only limited in relation to the other
+  // hyperbolic signal speeds and not by (potentially more restrictive) diffusive
+  // processes.
+  if constexpr (fluid == Fluid::mhd) {
+    auto dt_hyp_pkg = hydro_pkg->Param<Real>("dt_hyp");
+    if (cfl_hyp * min_dt_hyperbolic < dt_hyp_pkg) {
+      hydro_pkg->UpdateParam("dt_hyp", cfl_hyp * min_dt_hyperbolic);
+    }
+  }
   return cfl_hyp * min_dt_hyperbolic;
 }
 
+// provide the routine that estimates a stable timestep for this package
+template <Fluid fluid>
+Real EstimateTimestep(MeshData<Real> *md) {
+  // get to package via first block in Meshdata (which exists by construction)
+  auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
+  auto min_dt = std::numeric_limits<Real>::max();
+  auto dt_hyp = std::numeric_limits<Real>::max();
+
+  const auto calc_dt_hyp = hydro_pkg->Param<bool>("calc_dt_hyp");
+  if (calc_dt_hyp) {
+    dt_hyp = EstimateHyperbolicTimestep<fluid>(md);
+    min_dt = std::min(min_dt, dt_hyp);
+  }
+  
+  if (ProblemEstimateTimestep != nullptr) {
+    min_dt = std::min(min_dt, ProblemEstimateTimestep(md));
+  }
+
+  // maximum user dt
+  const auto max_dt = hydro_pkg->Param<Real>("max_dt");
+  if (max_dt > 0.0) {
+    min_dt = std::min(min_dt, max_dt);
+  }
+
+  return min_dt;
+}
+
+template <Fluid fluid, Reconstruction recon>
 TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
+
   auto pmb = md->GetBlockData(0)->GetBlockPointer();
   IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
+  
   int il, iu, jl, ju, kl, ku;
-  jl = jb.s, ju = jb.e, kl = kb.s, ku = kb.e;
+  il = ib.s, iu = ib.e + 1, jl = jb.s, ju = jb.e, kl = kb.s, ku = kb.e;
   // TODO(pgrete): are these looop limits are likely too large for 2nd order
   if (pmb->block_size.nx(X2DIR) > 1) {
     if (pmb->block_size.nx(X3DIR) == 1) // 2D
-      jl = jb.s - 1, ju = jb.e + 1, kl = kb.s, ku = kb.e;
+      jl = jb.s, ju = jb.e + 1, kl = kb.s, ku = kb.e;
     else // 3D
-      jl = jb.s - 1, ju = jb.e + 1, kl = kb.s - 1, ku = kb.e + 1;
+      jl = jb.s, ju = jb.e + 1, kl = kb.s, ku = kb.e + 1;
   }
 
   std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
@@ -260,7 +718,9 @@ TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
   auto pkg = pmb->packages.Get("Hydro");
   const int nhydro = pkg->Param<int>("nhydro");
 
-  const auto &eos = pkg->Param<AdiabaticHydroEOS>("eos");
+  const auto &eos =
+      pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
+                                           AdiabaticMHDEOS>::type>("eos");
 
   auto num_scratch_vars = nhydro;
   auto prim_list = std::vector<std::string>({"prim"});
@@ -274,6 +734,8 @@ TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
   size_t scratch_size_in_bytes =
       parthenon::ScratchPad2D<Real>::shmem_size(num_scratch_vars, nx1) * 2;
 
+  auto reconstruct = Reconstruct<fluid, recon>();
+
   parthenon::par_for_outer(
       DEFAULT_OUTER_LOOP_PATTERN, "x1 flux", DevExecSpace(), scratch_size_in_bytes,
       scratch_level, 0, cons_pack.GetDim(5) - 1, kl, ku, jl, ju,
@@ -281,98 +743,176 @@ TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
         const auto &coords = cons_pack.GetCoords(b);
         const auto &prim = prim_pack(b);
         auto &cons = cons_pack(b);
-        parthenon::ScratchPad2D<Real> wl(member.team_scratch(scratch_level),
-                                         num_scratch_vars, nx1);
-        parthenon::ScratchPad2D<Real> wr(member.team_scratch(scratch_level),
-                                         num_scratch_vars, nx1);
-        // get reconstructed state on faces
-        Reconstruct<X1DIR>(member, k, j, ib.s - 1, ib.e + 1, prim, wl, wr);
-        // Sync all threads in the team so that scratch memory is consistent
+        reconstruct.Solve(member, k, j, il, iu, IV1, prim, cons, eos);
         member.team_barrier();
 
-        RiemannSolver(member, k, j, ib.s, ib.e + 1, IV1, wl, wr, cons, eos);
       });
+
   //--------------------------------------------------------------------------------------
   // j-direction
   if (pmb->pmy_mesh->ndim >= 2) {
-    scratch_size_in_bytes =
-        parthenon::ScratchPad2D<Real>::shmem_size(num_scratch_vars, nx1) * 3;
-    // set the loop limits
-    il = ib.s - 1, iu = ib.e + 1, kl = kb.s, ku = kb.e;
-    if (pmb->block_size.nx(X3DIR) == 1) // 2D
-      kl = kb.s, ku = kb.e;
-    else // 3D
-      kl = kb.s - 1, ku = kb.e + 1;
 
     parthenon::par_for_outer(
-        DEFAULT_OUTER_LOOP_PATTERN, "x2 flux", DevExecSpace(), scratch_size_in_bytes,
-        scratch_level, 0, cons_pack.GetDim(5) - 1, kl, ku,
-        KOKKOS_LAMBDA(parthenon::team_mbr_t member, const int b, const int k) {
-          const auto &coords = cons_pack.GetCoords(b);
-          const auto &prim = prim_pack(b);
-          auto &cons = cons_pack(b);
-          parthenon::ScratchPad2D<Real> wl(member.team_scratch(scratch_level),
-                                           num_scratch_vars, nx1);
-          parthenon::ScratchPad2D<Real> wr(member.team_scratch(scratch_level),
-                                           num_scratch_vars, nx1);
-          parthenon::ScratchPad2D<Real> wlb(member.team_scratch(scratch_level),
-                                            num_scratch_vars, nx1);
-          for (int j = jb.s - 1; j <= jb.e + 1; ++j) {
-            // reconstruct L/R states at j
-            Reconstruct<X2DIR>(member, k, j, il, iu, prim, wlb, wr);
-            // Sync all threads in the team so that scratch memory is consistent
-            member.team_barrier();
-
-            if (j > jb.s - 1) {
-              RiemannSolver(member, k, j, il, iu, IV2, wl, wr, cons, eos);
-              member.team_barrier();
-            }
-
-            // swap the arrays for the next step
-            auto *tmp = wl.data();
-            wl.assign_data(wlb.data());
-            wlb.assign_data(tmp);
-          }
-        });
+      DEFAULT_OUTER_LOOP_PATTERN, "x2 flux", DevExecSpace(), scratch_size_in_bytes,
+      scratch_level, 0, cons_pack.GetDim(5) - 1, kl, ku, jl, ju,
+      KOKKOS_LAMBDA(parthenon::team_mbr_t member, const int b, const int k, const int j) {
+        const auto &coords = cons_pack.GetCoords(b);
+        const auto &prim = prim_pack(b);
+        auto &cons = cons_pack(b);
+        reconstruct.Solve(member, k, j, il, iu, IV2, prim, cons, eos);
+        member.team_barrier();
+        
+      });
   }
-
+  
   //--------------------------------------------------------------------------------------
   // k-direction
-
   if (pmb->pmy_mesh->ndim >= 3) {
-    // set the loop limits
-    il = ib.s - 1, iu = ib.e + 1, jl = jb.s - 1, ju = jb.e + 1;
 
     parthenon::par_for_outer(
-        DEFAULT_OUTER_LOOP_PATTERN, "x3 flux", DevExecSpace(), scratch_size_in_bytes,
-        scratch_level, 0, cons_pack.GetDim(5) - 1, jl, ju,
-        KOKKOS_LAMBDA(parthenon::team_mbr_t member, const int b, const int j) {
-          const auto &coords = cons_pack.GetCoords(b);
-          const auto &prim = prim_pack(b);
-          auto &cons = cons_pack(b);
-          parthenon::ScratchPad2D<Real> wl(member.team_scratch(scratch_level),
-                                           num_scratch_vars, nx1);
-          parthenon::ScratchPad2D<Real> wr(member.team_scratch(scratch_level),
-                                           num_scratch_vars, nx1);
-          parthenon::ScratchPad2D<Real> wlb(member.team_scratch(scratch_level),
-                                            num_scratch_vars, nx1);
-          for (int k = kb.s - 1; k <= kb.e + 1; ++k) {
-            // reconstruct L/R states at j
-            Reconstruct<X3DIR>(member, k, j, il, iu, prim, wlb, wr);
-            // Sync all threads in the team so that scratch memory is consistent
-            member.team_barrier();
+      DEFAULT_OUTER_LOOP_PATTERN, "x3 flux", DevExecSpace(), scratch_size_in_bytes,
+      scratch_level, 0, cons_pack.GetDim(5) - 1, kl, ku, jl, ju,
+      KOKKOS_LAMBDA(parthenon::team_mbr_t member, const int b, const int k, const int j) {
+        const auto &coords = cons_pack.GetCoords(b);
+        const auto &prim = prim_pack(b);
+        auto &cons = cons_pack(b);
+        reconstruct.Solve(member, k, j, il, iu, IV3, prim, cons, eos);
+        member.team_barrier();
 
-            if (k > kb.s - 1) {
-              RiemannSolver(member, k, j, il, iu, IV3, wl, wr, cons, eos);
-              member.team_barrier();
-            }
-            // swap the arrays for the next step
-            auto *tmp = wl.data();
-            wl.assign_data(wlb.data());
-            wlb.assign_data(tmp);
-          }
-        });
+      });
   }
+
+  return TaskStatus::complete;
+}
+
+// Apply first order flux correction, i.e., use first order reconstruction and a
+// diffusive LLF Riemann solver if a negative density or energy density is expected.
+// The current implementation is computationally not the most efficient one, but works
+// for all standard integrators (rk1, rk2, rk3, and vl) and with and without AMR.
+// In principle, without AMR one could directly use the results from the actual
+// flux divergence call.
+// However, with AMR (and coarse/fine flux correction) we need to correct the local
+// fluxes first before calling coarse/fine flux correction.
+// In addition, it may be enough to call first order flux correction once at the
+// final stage (rather than at every stage as right row).
+// However, this'd require an additional register to store the initial state and
+// we should first evaluate where the tradeoff between extra computational costs
+// (multiple calls) versus extra memory usage is.
+template <Fluid fluid>
+TaskStatus FirstOrderFluxCorrect(MeshData<Real> *u0_data, MeshData<Real> *u1_data,
+                                 const Real gam0_, const Real gam1_,
+                                 const Real beta_dt_) {
+  // Work around for CUDA <=11.6
+  const Real gam0 = gam0_;
+  const Real gam1 = gam1_;
+  const Real beta_dt = beta_dt_;
+  
+  auto pmb = u0_data->GetBlockData(0)->GetBlockPointer();
+  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
+  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
+
+  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
+  auto u0_cons_pack = u0_data->PackVariablesAndFluxes(flags_ind);
+  auto const &u0_prim_pack = u0_data->PackVariables(std::vector<std::string>{"prim"});
+  auto u1_cons_pack = u1_data->PackVariablesAndFluxes(flags_ind);
+  auto pkg = pmb->packages.Get("Hydro");
+
+  const auto &eos =
+      pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
+                                           AdiabaticMHDEOS>::type>("eos");
+
+
+  const int ndim = pmb->pmy_mesh->ndim;
+
+  constexpr auto NVAR = GetNVars<fluid>();
+
+  auto reconstruct = Reconstruct<fluid, Reconstruction::llf>();
+
+  std::int64_t num_corrected, num_need_floor;
+  // Potentially need multiple attempts as flux correction corrects 6 (in 3D) fluxes
+  // of a single cell at the same time. So the neighboring cells need to be rechecked with
+  // the corrected fluxes as the corrected fluxes in one cell may result in the need to
+  // correct all the fluxes of an originally "good" neighboring cell.
+  size_t num_attempts = 0;
+  do {
+    num_corrected = 0;
+
+    Kokkos::parallel_reduce(
+        "FirstOrderFluxCorrect",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            DevExecSpace(), {0, kb.s, jb.s, ib.s},
+            {u0_cons_pack.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1},
+            {1, 1, 1, ib.e + 1 - ib.s}),
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i,
+                      std::int64_t &lnum_corrected, std::int64_t &lnum_need_floor) {
+          const auto &coords = u0_cons_pack.GetCoords(b);
+          const auto &u0_prim = u0_prim_pack(b);
+          auto &u0_cons = u0_cons_pack(b);
+
+          // In principle, the u_cons.fluxes could be updated in parallel by a
+          // different thread resulting in a race conditon here. However, if the
+          // fluxes of a cell have been updated (anywhere) then the entire kernel will
+          // be called again anyway, and, at that point the already fixed
+          // u0_cons.fluxes will automaticlly be used here.
+          Real new_cons[NVAR];
+          for (auto v = 0; v < NVAR; v++) {
+            new_cons[v] =
+                gam0 * u0_cons(v, k, j, i) + gam1 * u1_cons_pack(b, v, k, j, i) +
+                beta_dt *
+                    parthenon::Update::FluxDivHelper(v, k, j, i, ndim, coords, u0_cons);
+          }
+
+          // no need to include gamma - 1 as we only care for negative values
+          auto new_p =
+              new_cons[IEN] -
+              0.5 * (SQR(new_cons[IM1]) + SQR(new_cons[IM2]) + SQR(new_cons[IM3])) /
+                  new_cons[IDN];
+          if constexpr (fluid == Fluid::mhd) {
+            new_p -= 0.5 * (SQR(new_cons[IB1]) + SQR(new_cons[IB2]) + SQR(new_cons[IB3]));
+          }
+          // no correction required
+          if (new_cons[IDN] > 0.0 && new_p > 0.0) {
+            return;
+          }
+          // if already tried 3 times and only pressure is negative, then we'll rely
+          // on the pressure floor during ConsToPrim conversion
+          if (num_attempts > 2 && new_cons[IDN] > 0.0 && new_p < 0.0) {
+            lnum_need_floor += 1;
+            return;
+          }
+          // In principle, there could be a racecondion as this loop goes over all
+          // k,j,i and we updating the i+1 flux here. However, the results are
+          // idential because u0_prim is never updated in this kernel so we don't
+          // worry about it.
+          // TODO(pgrete) as we need to keep the function signature idential for now
+          // (due to Cuda compiler bug) we could potentially template these function
+          // and get rid of the `if constexpr`
+
+          reconstruct.Solve(eos, k, j, i,     IV1, u0_prim, u0_cons);
+          reconstruct.Solve(eos, k, j, i + 1, IV1, u0_prim, u0_cons);
+
+          if (ndim >= 2) {
+            reconstruct.Solve(eos, k, j,     i, IV2, u0_prim, u0_cons);
+            reconstruct.Solve(eos, k, j + 1, i, IV2, u0_prim, u0_cons);
+          }
+          if (ndim >= 3) {
+            reconstruct.Solve(eos, k,     j, i, IV3, u0_prim, u0_cons);
+            reconstruct.Solve(eos, k + 1, j, i, IV3, u0_prim, u0_cons);
+          }
+          lnum_corrected += 1;
+        },
+        Kokkos::Sum<std::int64_t>(num_corrected),
+        Kokkos::Sum<std::int64_t>(num_need_floor));
+    // TODO(pgrete) make this optional and global (potentially store values in Params)
+    if (num_corrected > 0) {
+    std::cout << "[" << parthenon::Globals::my_rank << "] Attempt: " <<
+    num_attempts
+              << " Corrected (center): " << num_corrected
+              << " Failed (will rely on floor): " << num_need_floor << std::endl;
+    }
+    num_attempts += 1;
+  } while (num_corrected > 0 && num_attempts < 4);
 
   return TaskStatus::complete;
 }
